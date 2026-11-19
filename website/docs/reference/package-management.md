@@ -753,9 +753,13 @@ already available in uv's cache: the verified installation step is offline and
 never resolves additional runtime dependencies. The final normal sync retains
 ownership of project and workspace builds.
 
-Each sync handles at most 128 distinct failed artifacts, each no larger than
-2 GiB and with at most two mirror download attempts, within the sync's time
-budget. Hash/size mismatches, missing files and redirects fail rather than
+Each sync handles at most the number of distinct artifact URLs in the lock's
+PyPI registry rows, capped at 4096. The ceiling covers universal locks with
+many platform wheels as well as full-extra graphs larger than 128 packages;
+uv still selects which artifacts are needed. An artifact is never replayed
+within the operation. Each is no larger than 2 GiB and gets at most two mirror
+download attempts, all within one shared sync time budget (not renewed per
+artifact). Hash/size mismatches, missing files and redirects fail rather than
 silently switching versions or accepting unverified bytes. Mirror diagnostics
 name the package and `[hermes] python-artifact-mirror`, not the configured URL.
 An unavailable original host and a missing mirror artifact require fixing the

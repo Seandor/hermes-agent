@@ -33,7 +33,9 @@ if TYPE_CHECKING:
     from pm.environment import PythonEnvironment  # noqa: TID251 -- private engine collaborator
 
 CONFIG_KEY = "[hermes] python-artifact-mirror"
-MAX_ARTIFACTS = 128
+# A universal lock includes many platform wheels per package. Cover the supported
+# full graph without letting an unusually large lock remove the absolute bound.
+MAX_ARTIFACTS = 4096
 _MAX_SIZE = 2 * 1024**3
 
 
@@ -207,12 +209,28 @@ def _failure(package: str, stage: str, result) -> InstallError:
     return type(failure)(package, cause, f"{remedy}; check {CONFIG_KEY} in pip.conf/pip.ini")
 
 
+def _artifact_budget(lock: bytes) -> int:
+    """Count distinct registry URLs, not package rows or top-level invocations.
+
+    This only bounds work; failed_artifact still validates every selected entry.
+    uv remains responsible for selecting the platform/extra-specific graph.
+    """
+    import tomllib
+
+    data = tomllib.loads(lock.decode("utf-8"))
+    urls = {entry["url"] for package in data.get("package", [])
+            if package.get("source", {}).get("registry", "").rstrip("/") == "https://pypi.org/simple"
+            for entry in [*package.get("wheels", []), package.get("sdist", {})] if entry.get("url")}
+    return min(len(urls), MAX_ARTIFACTS)
+
+
 def sync_with_mirror(environment: PythonEnvironment, command: list[str], *, source: Path,
                      timeout: int, mirror: str) -> subprocess.CompletedProcess:
     """Retry only new, exact failed artifacts, ending with the original sync command."""
     deadline = time.monotonic() + timeout
     lock_path = source / "uv.lock"
     lock = lock_path.read_bytes()
+    budget = _artifact_budget(lock)
     # Capture instead of streaming: neither hostile HTTP errors nor URL credentials may reach logs.
     quiet = replace(environment, output=None, deadline=deadline)
     seen: set[str] = set()
@@ -238,8 +256,8 @@ def sync_with_mirror(environment: PythonEnvironment, command: list[str], *, sour
             artifact = failed_artifact(lock, (result.stderr or "") + (result.stdout or ""))
             if artifact is None:
                 raise _failure("venv", "sync", result) from None
-            if artifact.url in seen or len(seen) >= MAX_ARTIFACTS:
-                raise _error(artifact.package, f"fallback exhausted (at most {MAX_ARTIFACTS} distinct artifacts)")
+            if artifact.url in seen or len(seen) >= budget:
+                raise _error(artifact.package, f"fallback exhausted (at most {budget} distinct artifacts)")
             seen.add(artifact.url)
             directory = root / str(len(seen))
             directory.mkdir()
