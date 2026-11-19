@@ -689,7 +689,8 @@ PM does not retry bad hashes, certificate failures, local filesystem errors or
 other permanent failures. A successful probe followed by a range GET 403 or 404
 retains the CDN fallback: one serial attempt at the missing ranges. Extraction,
 verification and publication are not repeated. Python and JavaScript package
-requests remain under uv and pnpm's own retry policies.
+requests normally remain under uv and pnpm's own retry policies. The explicitly
+configured Python artifact fallback below has its own two-attempt download bound.
 
 ## Release age and package mirrors
 
@@ -705,6 +706,60 @@ which Hermes passes to uv, or with `UV_INDEX_URL`.
 `hermes pm lock` is the one step that applies the check. Run against a mirror
 without upload times, it stops with `has no publish time`; use
 `https://pypi.org/simple` for that step.
+
+### Locked Python artifacts on corporate networks
+
+PyPI has separate index and artifact hosts: `pypi.org/simple` describes releases,
+while `files.pythonhosted.org` serves their archives. `UV_INDEX_URL`,
+`PIP_INDEX_URL` and pip's `index-url` select an index for resolution; they do not
+replace exact artifact URLs already recorded in `uv.lock`. A network can reach
+an approved mirror's index while TLS to the original artifact CDN fails.
+
+For a mirror that preserves PyPI's `/packages/...` paths, explicitly opt in to
+hash-bound artifact fallback in your pip configuration (`pip.conf` on POSIX,
+`pip.ini` on Windows). This is separate from index configuration:
+
+```ini
+[hermes]
+python-artifact-mirror = https://pypi.tuna.tsinghua.edu.cn
+```
+
+Use a mirror approved for your network. The value is its base URL, not its
+`/simple` index or `/packages` directory. A base path is supported. You can use
+`PIP_CONFIG_FILE` to select a dedicated configuration file; `PIP_CONFIG_FILE`
+set to the platform's null device disables pip configuration, including this
+setting. Normal pip configuration precedence applies. No Hermes profile
+configuration or secret file needs changing.
+
+After deploying a Hermes version with this behavior, normal `hermes pm install`,
+source-update dependency completion, and `hermes pm repair` use it automatically.
+No fallback is enabled by default, and merely configuring an index is not consent
+to substitute artifact transport. Offline operations never contact the mirror.
+
+PM first runs its normal locked/frozen sync. If uv identifies a failed PyPI
+registry artifact, PM fetches that exact `/packages/...` path from the mirror.
+The original lock's SHA-256 and exact size must match before uv receives the
+file. PM uses uv's supported hash-required, no-dependencies installer with a
+private temporary wheelhouse, then repeats the original sync. uv still selects
+platform wheels, markers, extras and dependency versions. The official lock and
+project files are not rewritten or re-resolved for this fallback; no cache
+metadata is fabricated. Isolated PM runtime builds retain their index isolation.
+
+Only HTTPS mirror URLs without credentials, queries or fragments are accepted
+(loopback HTTP is allowed for local testing). Redirects are rejected. Private
+registries, direct URL, Git and local dependencies are not rewritten. Source
+archives can be installed only when their isolated build requirements are
+already available in uv's cache: the verified installation step is offline and
+never resolves additional runtime dependencies. The final normal sync retains
+ownership of project and workspace builds.
+
+Each sync handles at most 128 distinct failed artifacts, each no larger than
+2 GiB and with at most two mirror download attempts, within the sync's time
+budget. Hash/size mismatches, missing files and redirects fail rather than
+silently switching versions or accepting unverified bytes. Mirror diagnostics
+name the package and `[hermes] python-artifact-mirror`, not the configured URL.
+An unavailable original host and a missing mirror artifact require fixing the
+mirror or its configuration; index changes alone cannot repair those bytes.
 
 JavaScript workspace dependencies follow the same rule through
 `minimumReleaseAge` in `pnpm-workspace.yaml` (in minutes: `20160` is 14 days).
