@@ -311,6 +311,7 @@ class PythonEnvironment:
     offline: bool = False
     output: TextIO | None = None
     no_config: bool = False
+    deadline: float | None = None
 
     @property
     def executable(self) -> Path:
@@ -319,6 +320,11 @@ class PythonEnvironment:
         return venv_python(self.destination)
 
     def _run(self, args: list[str], *, cwd: Path, timeout: int) -> subprocess.CompletedProcess:
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise InstallError("venv", "Python artifact mirror sync deadline exceeded")
+            timeout = min(timeout, int(remaining))
         # Explicit index credentials survive, but cannot redirect the project,
         # interpreter or cache selected by the operation.
         env = _base_environment(self.env)
@@ -459,8 +465,14 @@ class PythonEnvironment:
             command += ["--extra", extra]
         for group in sorted(set(groups)):
             command += ["--group", group]
-        result = self._with_cache_recovery(
-            "sync", lambda: self._sync_attempt(command, cwd=source, timeout=timeout))
+        from pm.python_artifact_mirror import configured_mirror, sync_with_mirror
+
+        mirror = None if self.offline else configured_mirror(self.env)
+        if mirror:
+            result = sync_with_mirror(self, command, source=source, timeout=timeout, mirror=mirror)
+        else:
+            result = self._with_cache_recovery(
+                "sync", lambda: self._sync_attempt(command, cwd=source, timeout=timeout))
         if result.returncode:
             raise classify_uv_failure("sync", result.returncode, result.stderr or result.stdout)
 
