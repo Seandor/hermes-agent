@@ -95,6 +95,81 @@ def test_default_sync_never_uses_artifact_mirror(mirror_project):
     assert len(requests) == 1
 
 
+@pytest.mark.parametrize("ceiling", [None, 2])
+def test_full_graph_converges_in_one_sync_without_replaying_artifacts(mirror_project, monkeypatch, ceiling):
+    import tomllib
+    import pm.python_artifact_mirror as fallback
+    from pm.environments import site_packages
+
+    source, environment, wheel, _requests, _config = mirror_project
+    origin = tomllib.loads((source / "uv.lock").read_text(encoding="utf-8"))["package"][0]["wheels"][0]["url"].rsplit("/", 1)[0]
+    names = [f"graph_dep_{index}" for index in range(129)]
+    rows = []
+    for name in names:
+        artifact = _wheel(wheel.parent, name)
+        payload = artifact.read_bytes()
+        rows.append(f'[[package]]\nname="{name.replace("_", "-")}"\nversion="1.0"\n'
+                    'source={registry="https://pypi.org/simple"}\n'
+                    f'wheels=[{{url="{origin}/{artifact.name}",hash="sha256:{hashlib.sha256(payload).hexdigest()}",size={len(payload)}}}]\n')
+    dependencies = ",".join(f'"{name.replace("_", "-")}==1.0"' for name in names)
+    (source / "pyproject.toml").write_text(
+        '[project]\nname="mirror-root"\nversion="1"\nrequires-python=">=3.11"\n'
+        f'dependencies=[{dependencies}]\n[tool.uv]\npackage=false\n', encoding="utf-8")
+    locked_dependencies = ",".join(f'{{name="{name.replace("_", "-")}"}}' for name in names)
+    (source / "uv.lock").write_text(
+        'version=1\nrevision=3\nrequires-python=">=3.11"\n' + "".join(rows)
+        + '[[package]]\nname="mirror-root"\nversion="1"\nsource={virtual="."}\n'
+        + f'dependencies=[{locked_dependencies}]\n', encoding="utf-8")
+    before = (source / "uv.lock").read_bytes()
+    fetched = []
+    fetch = fallback.fetch_artifact
+
+    def record_fetch(artifact, *args, **kwargs):
+        fetched.append(artifact.url)
+        return fetch(artifact, *args, **kwargs)
+
+    monkeypatch.setattr(fallback, "fetch_artifact", record_fetch)
+    # Serial failed origin requests keep this full-graph test small and avoid
+    # uv cancelling hundreds of concurrent loopback responses on each retry.
+    environment = replace(environment, env={**environment.env, "UV_CONCURRENT_DOWNLOADS": "1"})
+    if ceiling is not None:
+        monkeypatch.setattr(fallback, "MAX_ARTIFACTS", ceiling)
+        with pytest.raises(InstallError, match=f"at most {ceiling} distinct artifacts"):
+            environment.sync(source, timeout=300)
+        assert len(fetched) == len(set(fetched)) == ceiling
+        assert (source / "uv.lock").read_bytes() == before
+        return
+    environment.sync(source, timeout=300)
+    environment.check(source / "uv.lock")
+    assert len(fetched) == len(set(fetched)) == len(names)
+    assert all((site_packages(environment.destination) / name / "__init__.py").is_file() for name in names)
+    assert (source / "uv.lock").read_bytes() == before
+
+
+def test_artifact_budget_counts_distinct_pypi_urls_across_wheels_and_sdist():
+    from pm.python_artifact_mirror import _artifact_budget
+
+    entries = ('wheels=[{url="https://files.pythonhosted.org/packages/a.whl"},'
+               '{url="https://files.pythonhosted.org/packages/b.whl"}]\n'
+               'sdist={url="https://files.pythonhosted.org/packages/a.tar.gz"}\n')
+    pypi = '[[package]]\nsource={registry="https://pypi.org/simple"}\n'
+    private = '[[package]]\nsource={registry="https://private.example/simple"}\n'
+    direct = '[[package]]\nsource={url="https://example.test/direct.whl"}\n'
+    baseline = (pypi + entries).encode()
+    assert _artifact_budget(baseline) == 3
+    assert _artifact_budget(baseline + baseline) == _artifact_budget(baseline)
+    assert _artifact_budget((pypi + entries + private + entries + direct + entries).encode()) == _artifact_budget(baseline)
+
+
+def test_artifact_budget_caps_oversized_universal_lock():
+    from pm.python_artifact_mirror import MAX_ARTIFACTS, _artifact_budget
+
+    wheels = ",".join(f'{{url="https://files.pythonhosted.org/packages/{index}.whl"}}'
+                      for index in range(MAX_ARTIFACTS + 1))
+    lock = f'[[package]]\nsource={{registry="https://pypi.org/simple"}}\nwheels=[{wheels}]\n'.encode()
+    assert _artifact_budget(lock) == MAX_ARTIFACTS
+
+
 @pytest.mark.parametrize("damage", ["hash", "short", "long", "missing"])
 def test_wrong_or_missing_artifact_never_installs(mirror_project, damage):
     source, environment, wheel, _requests, _config = mirror_project
